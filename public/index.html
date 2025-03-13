@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Live Stream Viewer</title>
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/video.js@7.11.4/dist/video-js.min.css"
+        />
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f4f4f4;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 5px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+            .video-container {
+                width: 100%;
+                margin-bottom: 20px;
+            }
+            .video-js {
+                width: 100%;
+                height: auto;
+                aspect-ratio: 16 / 9;
+            }
+            .info-box {
+                background-color: #f8f9fa;
+                padding: 15px;
+                border-radius: 4px;
+                margin-top: 20px;
+            }
+            .status {
+                font-weight: bold;
+            }
+            .live {
+                color: #28a745;
+            }
+            .offline {
+                color: #dc3545;
+            }
+            .segment-indicator {
+                margin-top: 10px;
+                height: 20px;
+                background-color: #e9ecef;
+                border-radius: 10px;
+                overflow: hidden;
+                position: relative;
+            }
+            .segment-progress {
+                height: 100%;
+                background-color: #007bff;
+                width: 0%;
+                transition: width 0.5s ease;
+            }
+            .storage-info {
+                margin-top: 15px;
+                padding-top: 15px;
+                border-top: 1px solid #dee2e6;
+            }
+            .notification {
+                margin-top: 10px;
+                padding: 10px;
+                border-radius: 4px;
+                background-color: #fff3cd;
+                border-left: 4px solid #ffc107;
+                opacity: 0;
+                transition: opacity 0.3s ease;
+            }
+            .notification.show {
+                opacity: 1;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Live Stream Viewer</h1>
+
+            <div class="video-container">
+                <video
+                    id="livestream"
+                    class="video-js vjs-default-skin vjs-big-play-centered"
+                    controls
+                >
+                    <p class="vjs-no-js">
+                        To view this video please enable JavaScript, and
+                        consider upgrading to a web browser that supports HTML5
+                        video
+                    </p>
+                </video>
+            </div>
+
+            <div class="info-box">
+                <h3>Stream Information</h3>
+                <div id="stream-status">
+                    Status: <span class="status">Initializing...</span>
+                </div>
+                <div id="stream-time">Elapsed Time: 00:00:00</div>
+                <div id="stream-segments">Segments Created: 0</div>
+
+                <div class="segment-indicator">
+                    <div id="segment-progress" class="segment-progress"></div>
+                </div>
+
+                <div class="storage-info">
+                    <h4>Storage Management</h4>
+                    <div id="storage-size">
+                        Current HLS storage: Calculating...
+                    </div>
+                    <div id="cleanup-notification" class="notification">
+                        Storage cleanup in progress...
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/video.js@7.11.4/dist/video.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.4.1/dist/socket.io.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@videojs/http-streaming@2.14.2/dist/videojs-http-streaming.min.js"></script>
+
+        <script>
+            document.addEventListener("DOMContentLoaded", function () {
+                // Initialize video.js player
+                const player = videojs("livestream", {
+                    fluid: true,
+                    responsive: true,
+                    liveui: true,
+                    html5: {
+                        hls: {
+                            overrideNative: true,
+                        },
+                    },
+                });
+
+                // Format time function (HH:MM:SS)
+                function formatTime(seconds) {
+                    const hrs = Math.floor(seconds / 3600);
+                    const mins = Math.floor((seconds % 3600) / 60);
+                    const secs = Math.floor(seconds % 60);
+                    return `${hrs.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+                }
+
+                // Connect to WebSocket
+                const socket = io();
+
+                // Get DOM elements
+                const statusEl = document.querySelector(
+                    "#stream-status .status",
+                );
+                const timeEl = document.getElementById("stream-time");
+                const segmentsEl = document.getElementById("stream-segments");
+                const progressEl = document.getElementById("segment-progress");
+                const storageEl = document.getElementById("storage-size");
+                const cleanupNotificationEl = document.getElementById(
+                    "cleanup-notification",
+                );
+
+                // Estimate storage size based on segment count
+                function updateStorageEstimate(segmentCount) {
+                    // Rough estimate: average segment is ~500KB for a medium quality stream
+                    const estimatedSizeMB = (segmentCount * 0.5).toFixed(1);
+                    storageEl.textContent = `Estimated HLS storage: ~${estimatedSizeMB}MB`;
+                }
+
+                // Show cleanup notification
+                function showCleanupNotification(message, duration = 5000) {
+                    cleanupNotificationEl.textContent = message;
+                    cleanupNotificationEl.classList.add("show");
+
+                    setTimeout(() => {
+                        cleanupNotificationEl.classList.remove("show");
+                    }, duration);
+                }
+
+                // Listen for initial stream info
+                socket.on("streamInfo", function (data) {
+                    updateStreamDisplay(data);
+
+                    // Load the video if streaming
+                    if (data.isStreaming) {
+                        player.src({
+                            src: data.hlsUrl,
+                            type: "application/x-mpegURL",
+                        });
+                        player
+                            .play()
+                            .catch((err) =>
+                                console.log(
+                                    "Playback will start after interaction",
+                                ),
+                            );
+                    }
+
+                    // Update storage estimate
+                    updateStorageEstimate(data.segmentCount || 0);
+                });
+
+                // Listen for stream updates
+                socket.on("streamUpdate", function (data) {
+                    updateStreamDisplay(data);
+
+                    // If stream just started, load the video
+                    if (
+                        data.isStreaming &&
+                        statusEl.textContent === "Offline"
+                    ) {
+                        player.src({
+                            src: data.hlsUrl,
+                            type: "application/x-mpegURL",
+                        });
+                        player
+                            .play()
+                            .catch((err) =>
+                                console.log(
+                                    "Playback will start after interaction",
+                                ),
+                            );
+                    }
+
+                    // Update storage estimate
+                    updateStorageEstimate(data.segmentCount || 0);
+                });
+
+                // Listen for segment creation events
+                socket.on("segmentCreated", function (data) {
+                    segmentsEl.textContent = `Segments Created: ${data.count}`;
+
+                    // Flash the progress bar
+                    progressEl.style.width = "100%";
+                    setTimeout(() => {
+                        progressEl.style.width = "0%";
+                    }, 500);
+
+                    // Update storage estimate
+                    updateStorageEstimate(data.count);
+                });
+
+                // Listen for cleanup events
+                socket.on("cleanupPerformed", function (data) {
+                    showCleanupNotification(
+                        `Storage cleanup complete: ${data.deletedCount} old segments (${data.deletedSizeMB}MB) removed`,
+                    );
+                    storageEl.textContent = `Current HLS storage: ${data.currentSizeMB}MB`;
+                });
+
+                // Update the stream display with latest info
+                function updateStreamDisplay(data) {
+                    // Update status
+                    statusEl.textContent = data.isStreaming
+                        ? "Live"
+                        : "Offline";
+                    statusEl.className =
+                        "status " + (data.isStreaming ? "live" : "offline");
+
+                    // Update time display
+                    if (data.elapsedSeconds) {
+                        timeEl.textContent = `Elapsed Time: ${formatTime(data.elapsedSeconds)}`;
+                    }
+
+                    // Update segments count
+                    segmentsEl.textContent = `Segments Created: ${data.segmentCount || 0}`;
+                }
+            });
+        </script>
+    </body>
+</html>
