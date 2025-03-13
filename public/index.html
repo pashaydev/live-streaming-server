@@ -129,16 +129,27 @@
         <script>
             document.addEventListener("DOMContentLoaded", function () {
                 // Initialize video.js player
-                const player = videojs("livestream", {
+                const playerOptions = {
                     fluid: true,
                     responsive: true,
                     liveui: true,
                     html5: {
                         hls: {
-                            overrideNative: true,
+                            overrideNative: !videojs.browser.IS_SAFARI,
+                            enableLowInitialPlaylist: true,
+                            limitRenditionByPlayerDimensions: true,
+                            useBandwidthFromLocalStorage: true,
                         },
+                        nativeAudioTracks: false,
+                        nativeVideoTracks: false,
                     },
-                });
+                    liveTracker: {
+                        trackingThreshold: 0.5,
+                        liveTolerance: 15,
+                    },
+                };
+
+                const player = videojs("livestream", playerOptions);
 
                 // Format time function (HH:MM:SS)
                 function formatTime(seconds) {
@@ -149,7 +160,24 @@
                 }
 
                 // Connect to WebSocket
-                const socket = io();
+                const socket = io({
+                    transports: ["websocket"],
+                    upgrade: false,
+                    reconnectionAttempts: 5,
+                    reconnectionDelay: 1000,
+                    timeout: 20000,
+                });
+
+                function throttle(callback, delay) {
+                    let lastCall = 0;
+                    return function (...args) {
+                        const now = Date.now();
+                        if (now - lastCall >= delay) {
+                            lastCall = now;
+                            callback.apply(this, args);
+                        }
+                    };
+                }
 
                 // Get DOM elements
                 const statusEl = document.querySelector(
@@ -203,6 +231,23 @@
                     updateStorageEstimate(data.segmentCount || 0);
                 });
 
+                const updateStreamDisplay = throttle(function (data) {
+                    // Update status
+                    statusEl.textContent = data.isStreaming
+                        ? "Live"
+                        : "Offline";
+                    statusEl.className =
+                        "status " + (data.isStreaming ? "live" : "offline");
+
+                    // Update time display
+                    if (data.elapsedSeconds) {
+                        timeEl.textContent = `Elapsed Time: ${formatTime(data.elapsedSeconds)}`;
+                    }
+
+                    // Update segments count
+                    segmentsEl.textContent = `Segments Created: ${data.segmentCount || 0}`;
+                }, 1000); // Update UI max once per second
+
                 // Listen for stream updates
                 socket.on("streamUpdate", function (data) {
                     updateStreamDisplay(data);
@@ -250,24 +295,6 @@
                     );
                     storageEl.textContent = `Current HLS storage: ${data.currentSizeMB}MB`;
                 });
-
-                // Update the stream display with latest info
-                function updateStreamDisplay(data) {
-                    // Update status
-                    statusEl.textContent = data.isStreaming
-                        ? "Live"
-                        : "Offline";
-                    statusEl.className =
-                        "status " + (data.isStreaming ? "live" : "offline");
-
-                    // Update time display
-                    if (data.elapsedSeconds) {
-                        timeEl.textContent = `Elapsed Time: ${formatTime(data.elapsedSeconds)}`;
-                    }
-
-                    // Update segments count
-                    segmentsEl.textContent = `Segments Created: ${data.segmentCount || 0}`;
-                }
             });
         </script>
     </body>

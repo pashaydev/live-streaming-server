@@ -8,6 +8,12 @@ const app = express();
 const server = http.createServer(app);
 const io = require("socket.io")(server);
 require("dotenv").config();
+const { Worker } = require("worker_threads");
+const compression = require("compression");
+app.use(compression());
+
+// Maintain a running size total instead of recalculating
+let currentFolderSizeMB = 0;
 
 // File system promisified methods
 const stat = promisify(fs.stat);
@@ -58,70 +64,63 @@ async function getFolderSize(dirPath) {
 
 // Clean up old fragments when folder exceeds size limit
 async function cleanupFragments() {
-  try {
-    // Calculate current folder size in MB
-    const sizeInBytes = await getFolderSize(hlsDir);
-    const sizeInMB = sizeInBytes / (1024 * 1024);
+  // Only start cleanup if we're above threshold
+  const sizeInMB = currentFolderSizeMB;
 
-    // If size exceeds limit, clean up oldest fragments
-    if (sizeInMB > MAX_FOLDER_SIZE_MB) {
-      console.log(
-        `HLS folder size (${sizeInMB.toFixed(2)}MB) exceeds ${MAX_FOLDER_SIZE_MB}MB, cleaning up old fragments...`,
-      );
+  if (sizeInMB > MAX_FOLDER_SIZE_MB) {
+    const worker = new Worker(
+      `
+      const { parentPort, workerData } = require('worker_threads');
+      const fs = require('fs');
+      const path = require('path');
 
-      // Get all .ts files and sort by creation time
-      const files = fs
-        .readdirSync(hlsDir)
-        .filter((file) => file.endsWith(".ts"))
-        .map((file) => {
+      // Worker code for cleanup
+      const { hlsDir, targetSizeMB, filesToKeep } = workerData;
+
+      // Get and sort files
+      const files = fs.readdirSync(hlsDir)
+        .filter(file => file.endsWith('.ts'))
+        .map(file => {
           const filePath = path.join(hlsDir, file);
           const stats = fs.statSync(filePath);
-          return {
-            name: file,
-            path: filePath,
-            creationTime: stats.birthtimeMs || stats.ctimeMs, // Use creation time or change time
-            size: stats.size,
-          };
+          return { name: file, path: filePath, creationTime: stats.birthtimeMs, size: stats.size };
         })
-        .sort((a, b) => a.creationTime - b.creationTime); // Sort oldest first
+        .sort((a, b) => a.creationTime - b.creationTime);
 
-      // Ensure we keep enough recent segments for the playback window
-      const segmentsToKeep = Math.ceil(WINDOW_DURATION / SEGMENT_DURATION);
-      const targetSizeToDelete =
-        sizeInBytes - CLEANUP_THRESHOLD_MB * 1024 * 1024;
+      // Delete oldest files but keep required number
       let deletedSize = 0;
       let deletedCount = 0;
 
-      // Delete oldest files first, but keep required number for playback
-      for (let i = 0; i < files.length - segmentsToKeep; i++) {
+      for (let i = 0; i < files.length - filesToKeep; i++) {
         const file = files[i];
         try {
           fs.unlinkSync(file.path);
           deletedSize += file.size;
           deletedCount++;
-
-          // Stop when we've deleted enough
-          if (deletedSize >= targetSizeToDelete) {
-            break;
-          }
         } catch (err) {
-          console.warn(`Error deleting ${file.path}: ${err.message}`);
+          // Continue with next file
         }
       }
 
-      console.log(
-        `Cleanup complete. Deleted ${deletedCount} fragments (${(deletedSize / (1024 * 1024)).toFixed(2)}MB)`,
-      );
+      parentPort.postMessage({ deletedSize, deletedCount });
+    `,
+      {
+        workerData: {
+          hlsDir,
+          targetSizeMB: CLEANUP_THRESHOLD_MB,
+          filesToKeep: Math.ceil(WINDOW_DURATION / SEGMENT_DURATION),
+        },
+      },
+    );
 
-      // Send update to clients
+    worker.on("message", (result) => {
+      updateFolderSize(-result.deletedSize);
       io.emit("cleanupPerformed", {
-        deletedCount,
-        deletedSizeMB: (deletedSize / (1024 * 1024)).toFixed(2),
-        currentSizeMB: ((sizeInBytes - deletedSize) / (1024 * 1024)).toFixed(2),
+        deletedCount: result.deletedCount,
+        deletedSizeMB: (result.deletedSize / (1024 * 1024)).toFixed(2),
+        currentSizeMB: currentFolderSizeMB.toFixed(2),
       });
-    }
-  } catch (error) {
-    console.error(`Error during fragment cleanup: ${error.message}`);
+    });
   }
 }
 
@@ -147,19 +146,31 @@ function startLiveStream() {
 
   // Use FFmpeg to process the video as a simulated live stream
   ffmpegProcess = spawn("ffmpeg", [
-    "-re", // Read input at native framerate (simulate real-time)
+    "-re",
     "-i",
-    STREAM_URL, // Input video from web
+    STREAM_URL,
     "-c:v",
-    "libx264", // Video codec
+    "libx264",
+    "-preset",
+    "veryfast", // Faster encoding
+    "-tune",
+    "zerolatency", // Optimize for streaming
+    "-profile:v",
+    "baseline", // More compatible profile
+    "-level",
+    "3.0",
+    "-crf",
+    "23", // Balance quality and size
     "-c:a",
-    "aac", // Audio codec
+    "aac",
+    "-b:a",
+    "128k", // Lower audio bitrate
     "-f",
-    "hls", // HLS output format
+    "hls",
     "-hls_time",
-    SEGMENT_DURATION.toString(), // Duration of each segment
+    SEGMENT_DURATION.toString(),
     "-hls_list_size",
-    Math.ceil(WINDOW_DURATION / SEGMENT_DURATION), // Keep segments for window duration
+    Math.ceil(WINDOW_DURATION / SEGMENT_DURATION),
     "-hls_flags",
     "delete_segments+append_list",
     "-hls_segment_filename",
@@ -169,12 +180,30 @@ function startLiveStream() {
 
   isStreaming = true;
 
+  function updateFolderSize(sizeChangeBytes) {
+    currentFolderSizeMB += sizeChangeBytes / (1024 * 1024);
+  }
+
   ffmpegProcess.stderr.on("data", (data) => {
     const output = data.toString();
 
     // Track new segments
     if (output.includes("segment") && output.includes(".ts")) {
       segmentCount++;
+
+      // Get the new segment's size
+      try {
+        const match = output.match(/segment(\d+)\.ts/);
+        if (match) {
+          const fileName = `segment${match[1]}.ts`;
+          const filePath = path.join(hlsDir, fileName);
+          const stats = fs.statSync(filePath);
+          updateFolderSize(stats.size);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+
       io.emit("segmentCreated", {
         count: segmentCount,
         time: Date.now(),
@@ -265,4 +294,18 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   // Start streaming automatically when server starts
   startLiveStream();
+});
+
+const NodeCache = require("node-cache");
+const { Console } = require("console");
+const streamStateCache = new NodeCache({ stdTTL: 2 }); // 2-second TTL
+
+// Cache stream state calculations
+app.get("/api/stream-state", (req, res) => {
+  let state = streamStateCache.get("streamState");
+  if (!state) {
+    state = calculateStreamState();
+    streamStateCache.set("streamState", state);
+  }
+  res.json(state);
 });
