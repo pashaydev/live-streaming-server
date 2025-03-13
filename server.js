@@ -7,17 +7,16 @@ const { promisify } = require("util");
 const app = express();
 const server = http.createServer(app);
 const io = require("socket.io")(server);
-require("dotenv").config();
 const { Worker } = require("worker_threads");
 const compression = require("compression");
-app.use(compression());
+require("dotenv").config();
 
-// Maintain a running size total instead of recalculating
 let currentFolderSizeMB = 0;
 
 // File system promisified methods
 const stat = promisify(fs.stat);
 
+app.use(compression());
 // Serve static files
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/hls", express.static(path.join(__dirname, "hls")));
@@ -65,7 +64,7 @@ async function getFolderSize(dirPath) {
 // Clean up old fragments when folder exceeds size limit
 async function cleanupFragments() {
   // Only start cleanup if we're above threshold
-  const sizeInMB = currentFolderSizeMB;
+  const sizeInMB = getFolderSize(dirPath);
 
   if (sizeInMB > MAX_FOLDER_SIZE_MB) {
     const worker = new Worker(
