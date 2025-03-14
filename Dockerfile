@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM oven/bun:slim
 
 # Create app directory
 WORKDIR /app
@@ -10,8 +10,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install app dependencies
-COPY package*.json ./
-RUN npm install
+COPY package*.json bun.lockb* ./
+RUN bun install --frozen-lockfile
 
 # Bundle app source
 COPY . .
@@ -23,4 +23,4 @@ RUN mkdir -p hls
 EXPOSE 3000
 
 # Start the application
-CMD ["node", "server.js"]
+CMD ["bun", "server.js"]
